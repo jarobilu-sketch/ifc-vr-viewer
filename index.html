@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IFC VR Viewer</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#1b1f27;font-family:system-ui,sans-serif;color:#e8eaed}
+  canvas{display:block}
+  #ui{position:fixed;top:12px;left:12px;background:rgba(20,24,32,.9);padding:12px 14px;border-radius:10px;max-width:330px;font-size:14px;line-height:1.45;z-index:5}
+  #ui h1{font-size:16px;margin:0 0 8px}
+  #ui input{max-width:100%}
+  #status{margin-top:8px;color:#9fb4c8}
+  #help{margin-top:8px;font-size:12px;color:#aab}
+  #info{position:fixed;top:12px;right:12px;bottom:12px;width:360px;overflow:auto;background:rgba(20,24,32,.9);padding:12px 14px;border-radius:10px;font-size:13px;display:none;z-index:5}
+  #info h2{font-size:15px;margin:14px 0 6px;color:#ff9a3c}
+  #info h2:first-child{margin-top:0}
+  #info table{width:100%;border-collapse:collapse}
+  #info td{padding:2px 4px;vertical-align:top;border-bottom:1px solid rgba(255,255,255,.07);word-break:break-word}
+  #info td:first-child{color:#9fb4c8;width:42%}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="ui">
+  <h1>IFC VR Viewer</h1>
+  <input type="file" id="file" accept=".ifc">
+  <div id="status">Bitte eine IFC-Datei wählen.</div>
+  <div id="help">
+    Erst IFC laden, dann unten «ENTER VR».<br>
+    <b>VR:</b> Linker Stick = gehen (Klick = schneller), rechter Stick = drehen (links/rechts) und Höhe (hoch/runter),
+    Trigger = Bauteil anwählen, A = nächste Seite, B = Panel aus/an.<br>
+    <b>Desktop:</b> Maus = Orbit, Klick = Bauteil anwählen.
+  </div>
+</div>
+<div id="info"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import * as WebIFC from 'https://cdn.jsdelivr.net/npm/web-ifc@0.0.57/web-ifc-api.js';
+
+const WEBIFC_BASE = 'https://cdn.jsdelivr.net/npm/web-ifc@0.0.57/';
+
+// ---------- DOM ----------
+const elStatus = document.getElementById('status');
+const elInfo = document.getElementById('info');
+const setStatus = (t) => { elStatus.textContent = t; };
+
+// ---------- Three.js Grundaufbau ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87a7c4);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.05, 2000);
+camera.position.set(15, 12, 15);
+
+// "Rig": Kamera + Controller hängen daran, damit wir uns in VR bewegen können
+const rig = new THREE.Group();
+rig.add(camera);
+scene.add(rig);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.position.set(30, 60, 20);
+scene.add(sun);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---------- IFC ----------
+const ifcApi = new WebIFC.IfcAPI();
+let ifcReady = false;
+let modelID = -1;
+let modelGroup = null;
+let startPos = new THREE.Vector3();
+const elementMeshes = new Map();   // expressID -> [Mesh]
+const relMap = new Map();          // expressID -> [PropertySet-/Quantity-IDs]
+const psetCache = new Map();       // psetID -> {name, items}
+const materialCache = new Map();
+
+async function initIfc() {
+  if (ifcReady) return;
+  ifcApi.SetWasmPath(WEBIFC_BASE, true);
+  await ifcApi.Init();
+  ifcReady = true;
+}
+
+function getMaterial(c) {
+  const key = [c.x, c.y, c.z, c.w].map((v) => v.toFixed(3)).join('_');
+  let m = materialCache.get(key);
+  if (!m) {
+    m = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(c.x, c.y, c.z),
+      opacity: c.w,
+      transparent: c.w < 1,
+      side: THREE.DoubleSide,
+      roughness: 0.85,
+      metalness: 0.0,
+    });
+    materialCache.set(key, m);
+  }
+  return m;
+}
+
+function clearModel() {
+  deselect();
+  if (modelGroup) {
+    scene.remove(modelGroup);
+    modelGroup.traverse((o) => { if (o.geometry) o.geometry.dispose(); });
+    modelGroup = null;
+  }
+  materialCache.forEach((m) => m.dispose());
+  materialCache.clear();
+  elementMeshes.clear();
+  relMap.clear();
+  psetCache.clear();
+  if (modelID >= 0) {
+    try { ifcApi.CloseModel(modelID); } catch (e) { /* ignorieren */ }
+    modelID = -1;
+  }
+}
+
+async function loadIfc(file) {
+  try {
+    setStatus('Lese Datei …');
+    const data = new Uint8Array(await file.arrayBuffer());
+    await initIfc();
+    clearModel();
+    setStatus('Verarbeite IFC (kann bei grossen Modellen dauern) …');
+    await new Promise((r) => setTimeout(r, 30));
+
+    modelID = ifcApi.OpenModel(data, { COORDINATE_TO_ORIGIN: true });
+
+    const group = new THREE.Group();
+    let meshCount = 0;
+
+    ifcApi.StreamAllMeshes(modelID, (flatMesh) => {
+      const expressID = flatMesh.expressID;
+      const geoms = flatMesh.geometries;
+      for (let i = 0; i < geoms.size(); i++) {
+        const pg = geoms.get(i);
+        const g = ifcApi.GetGeometry(modelID, pg.geometryExpressID);
+        const verts = ifcApi.GetVertexArray(g.GetVertexData(), g.GetVertexDataSize());
+        const idx = ifcApi.GetIndexArray(g.GetIndexData(), g.GetIndexDataSize());
+
+        // Kopien anlegen (die Arrays zeigen auf den WASM-Speicher)
+        const ib = new THREE.InterleavedBuffer(new Float32Array(verts), 6);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.InterleavedBufferAttribute(ib, 3, 0));
+        geo.setAttribute('normal', new THREE.InterleavedBufferAttribute(ib, 3, 3));
+        geo.setIndex(new THREE.BufferAttribute(new Uint32Array(idx), 1));
+
+        const mat = getMaterial(pg.color);
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.matrix.fromArray(pg.flatTransformation);
+        mesh.matrixAutoUpdate = false;
+        mesh.userData.expressID = expressID;
+        mesh.userData.origMat = mat;
+        mesh.userData.transparent = mat.transparent;
+        group.add(mesh);
+
+        if (!elementMeshes.has(expressID)) elementMeshes.set(expressID, []);
+        elementMeshes.get(expressID).push(mesh);
+        meshCount++;
+        g.delete();
+      }
+    });
+
+    // IFC ist Z-up, Three.js ist Y-up
+    group.rotation.x = -Math.PI / 2;
+    scene.add(group);
+    modelGroup = group;
+    group.updateMatrixWorld(true);
+
+    buildRelationMap();
+
+    // Startposition und Kamera
+    const box = new THREE.Box3().setFromObject(group);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    startPos.set(center.x, box.min.y, center.z);
+    const dist = Math.max(size.x, size.y, size.z) * 1.2 + 5;
+    camera.position.set(center.x + dist * 0.7, center.y + dist * 0.5, center.z + dist * 0.7);
+    controls.target.copy(center);
+    controls.update();
+
+    setStatus(`${elementMeshes.size} Bauteile, ${meshCount} Meshes geladen.`);
+  } catch (err) {
+    console.error(err);
+    setStatus('Fehler beim Laden: ' + (err && err.message ? err.message : err));
+  }
+}
+
+document.getElementById('file').addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (f) loadIfc(f);
+});
+
+// ---------- Eigenschaften ----------
+function buildRelationMap() {
+  try {
+    const ids = ifcApi.GetLineIDsWithType(modelID, WebIFC.IFCRELDEFINESBYPROPERTIES);
+    for (let i = 0; i < ids.size(); i++) {
+      const rel = ifcApi.GetLine(modelID, ids.get(i));
+      let defs = rel.RelatingPropertyDefinition;
+      defs = Array.isArray(defs) ? defs : [defs];
+      const defIds = defs.map((d) => d && d.value).filter((v) => v !== undefined && v !== null);
+      const related = rel.RelatedObjects || [];
+      for (const o of related) {
+        const oid = o && o.value;
+        if (oid === undefined) continue;
+        if (!relMap.has(oid)) relMap.set(oid, []);
+        relMap.get(oid).push(...defIds);
+      }
+    }
+  } catch (e) {
+    console.warn('Property-Beziehungen konnten nicht gelesen werden', e);
+  }
+}
+
+function valueToString(v) {
+  if (v === null || v === undefined) return '';
+  if (Array.isArray(v)) return v.map(valueToString).join(', ');
+  if (typeof v === 'object') return 'value' in v ? valueToString(v.value) : '';
+  return String(v);
+}
+
+function propValue(p) {
+  const keys = ['NominalValue', 'LengthValue', 'AreaValue', 'VolumeValue', 'CountValue',
+    'WeightValue', 'TimeValue', 'EnumerationValues', 'ListValues'];
+  for (const k of keys) {
+    if (p[k] !== undefined && p[k] !== null) return valueToString(p[k]);
+  }
+  return '';
+}
+
+function getPset(defId) {
+  if (psetCache.has(defId)) return psetCache.get(defId);
+  let res = null;
+  try {
+    const line = ifcApi.GetLine(modelID, defId, true);
+    const props = line.HasProperties || line.Quantities || [];
+    res = {
+      name: valueToString(line.Name) || 'Eigenschaften',
+      items: props
+        .filter((p) => p && p.Name)
+        .map((p) => ({ k: valueToString(p.Name), v: propValue(p) })),
+    };
+  } catch (e) {
+    res = null;
+  }
+  psetCache.set(defId, res);
+  return res;
+}
+
+function typeName(code) {
+  try { return ifcApi.GetNameFromTypeCode(code); } catch (e) { return String(code); }
+}
+
+function describe(id) {
+  const out = [];
+  let line = null;
+  try { line = ifcApi.GetLine(modelID, id); } catch (e) { /* ignorieren */ }
+  const val = (x) => valueToString(x) || '–';
+  out.push({ k: 'Name', v: line ? val(line.Name) : '–' });
+  out.push({ k: 'Typ', v: line ? typeName(line.type) : '–' });
+  out.push({ k: 'GlobalId', v: line ? val(line.GlobalId) : '–' });
+  out.push({ k: 'Express-ID', v: String(id) });
+  if (line && line.ObjectType) out.push({ k: 'ObjectType', v: val(line.ObjectType) });
+  if (line && line.Tag) out.push({ k: 'Tag', v: val(line.Tag) });
+  const defIds = relMap.get(id) || [];
+  for (const d of defIds) {
+    const ps = getPset(d);
+    if (!ps) continue;
+    out.push({ section: ps.name });
+    for (const it of ps.items) out.push(it);
+  }
+  return out;
+}
+
+// ---------- Auswahl / Hervorhebung ----------
+const highlightMat = new THREE.MeshStandardMaterial({
+  color: 0xff7a00, emissive: 0xff4400, emissiveIntensity: 0.55, side: THREE.DoubleSide,
+});
+let selectedId = null;
+
+function deselect() {
+  if (selectedId !== null && elementMeshes.has(selectedId)) {
+    for (const m of elementMeshes.get(selectedId)) m.material = m.userData.origMat;
+  }
+  selectedId = null;
+}
+
+function select(id) {
+  deselect();
+  selectedId = id;
+  for (const m of elementMeshes.get(id) || []) m.material = highlightMat;
+  entries = describe(id);
+  page = 0;
+  showInfoDesktop();
+  if (renderer.xr.isPresenting) showPanelInVR();
+}
+
+const raycaster = new THREE.Raycaster();
+raycaster.far = 80;
+
+function pickWith(rc) {
+  if (!modelGroup) return;
+  const hits = rc.intersectObjects(modelGroup.children, false);
+  if (!hits.length) { deselect(); hideInfoDesktop(); panel.visible = false; return; }
+  // Durchsichtiges (Glas) nach Möglichkeit überspringen
+  const hit = hits.find((h) => !h.object.userData.transparent) || hits[0];
+  select(hit.object.userData.expressID);
+}
+
+// ---------- Desktop-Info (HTML) ----------
+let entries = [];
+let page = 0;
+
+function showInfoDesktop() {
+  if (renderer.xr.isPresenting) return;
+  elInfo.replaceChildren();
+  let table = null;
+  for (const e of entries) {
+    if (e.section) {
+      const h = document.createElement('h2');
+      h.textContent = e.section;
+      elInfo.appendChild(h);
+      table = null;
+    } else {
+      if (!table) { table = document.createElement('table'); elInfo.appendChild(table); }
+      const tr = document.createElement('tr');
+      const a = document.createElement('td'); a.textContent = e.k;
+      const b = document.createElement('td'); b.textContent = e.v;
+      tr.append(a, b);
+      table.appendChild(tr);
+    }
+  }
+  elInfo.style.display = 'block';
+}
+function hideInfoDesktop() { elInfo.style.display = 'none'; }
+
+// Desktop-Klick (nur wenn die Maus nicht gezogen wurde)
+let downPos = null;
+renderer.domElement.addEventListener('pointerdown', (e) => { downPos = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (renderer.xr.isPresenting || !downPos) return;
+  if (Math.hypot(e.clientX - downPos[0], e.clientY - downPos[1]) > 5) return;
+  const ndc = new THREE.Vector2(
+    (e.clientX / window.innerWidth) * 2 - 1,
+    -(e.clientY / window.innerHeight) * 2 + 1,
+  );
+  raycaster.setFromCamera(ndc, camera);
+  pickWith(raycaster);
+});
+
+// ---------- VR-Panel (Canvas-Textur) ----------
+const PW = 768, PH = 1024, LH = 34, TOP = 84, LINES = 25;
+const panelCanvas = document.createElement('canvas');
+panelCanvas.width = PW; panelCanvas.height = PH;
+const pctx = panelCanvas.getContext('2d');
+const panelTex = new THREE.CanvasTexture(panelCanvas);
+panelTex.colorSpace = THREE.SRGBColorSpace;
+const panel = new THREE.Mesh(
+  new THREE.PlaneGeometry(0.6, 0.8),
+  new THREE.MeshBasicMaterial({ map: panelTex, side: THREE.DoubleSide, transparent: true, depthTest: false }),
+);
+panel.renderOrder = 999;
+panel.visible = false;
+scene.add(panel);
+
+function fit(ctx, text, maxW) {
+  if (ctx.measureText(text).width <= maxW) return text;
+  while (text.length > 1 && ctx.measureText(text + '…').width > maxW) text = text.slice(0, -1);
+  return text + '…';
+}
+
+function drawPanel() {
+  const c = pctx;
+  c.clearRect(0, 0, PW, PH);
+  c.fillStyle = 'rgba(18,22,30,0.95)';
+  c.fillRect(0, 0, PW, PH);
+  c.fillStyle = '#ff9a3c';
+  c.fillRect(0, 0, PW, 6);
+
+  const pages = Math.max(1, Math.ceil(entries.length / LINES));
+  page = ((page % pages) + pages) % pages;
+
+  c.textBaseline = 'middle';
+  c.textAlign = 'left';
+  c.font = 'bold 30px sans-serif';
+  c.fillStyle = '#ffffff';
+  c.fillText('Bauteil-Eigenschaften', 20, 44);
+  c.font = '22px sans-serif';
+  c.fillStyle = '#9fb4c8';
+  c.textAlign = 'right';
+  c.fillText(`Seite ${page + 1}/${pages}`, PW - 20, 44);
+  c.textAlign = 'left';
+
+  const slice = entries.slice(page * LINES, page * LINES + LINES);
+  slice.forEach((e, i) => {
+    const y = TOP + i * LH + LH / 2;
+    if (e.section) {
+      c.font = 'bold 26px sans-serif';
+      c.fillStyle = '#ff9a3c';
+      c.fillText(fit(c, e.section, PW - 40), 20, y);
+    } else {
+      c.font = '24px sans-serif';
+      c.fillStyle = '#9fb4c8';
+      c.fillText(fit(c, e.k, 290), 20, y);
+      c.fillStyle = '#ffffff';
+      c.fillText(fit(c, e.v, PW - 350), 330, y);
+    }
+  });
+
+  c.font = '20px sans-serif';
+  c.fillStyle = '#7d8a99';
+  c.fillText('A: nächste Seite    B: Panel aus/an', 20, PH - 28);
+  panelTex.needsUpdate = true;
+}
+
+const _p = new THREE.Vector3();
+const _d = new THREE.Vector3();
+function showPanelInVR() {
+  const cam = renderer.xr.getCamera();
+  cam.getWorldPosition(_p);
+  cam.getWorldDirection(_d);
+  _d.y = 0;
+  if (_d.lengthSq() < 1e-6) _d.set(0, 0, -1);
+  _d.normalize();
+  panel.position.copy(_p).addScaledVector(_d, 1.0);
+  panel.position.y = _p.y - 0.05;
+  panel.lookAt(_p.x, panel.position.y, _p.z);
+  drawPanel();
+  panel.visible = true;
+}
+
+// ---------- VR-Controller ----------
+const tempMatrix = new THREE.Matrix4();
+const controllerFactory = new XRControllerModelFactory();
+
+function onSelectStart(event) {
+  const controller = event.target;
+  tempMatrix.identity().extractRotation(controller.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+  raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+  pickWith(raycaster);
+}
+
+for (let i = 0; i < 2; i++) {
+  const controller = renderer.xr.getController(i);
+  controller.addEventListener('selectstart', onSelectStart);
+  const ray = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]),
+    new THREE.LineBasicMaterial({ color: 0xffffff }),
+  );
+  ray.scale.z = 6;
+  controller.add(ray);
+  rig.add(controller);
+
+  const grip = renderer.xr.getControllerGrip(i);
+  grip.add(controllerFactory.createControllerModel(grip));
+  rig.add(grip);
+}
+
+renderer.xr.addEventListener('sessionstart', () => {
+  controls.enabled = false;
+  rig.position.copy(startPos);
+  rig.rotation.set(0, 0, 0);
+  hideInfoDesktop();
+});
+renderer.xr.addEventListener('sessionend', () => {
+  controls.enabled = true;
+  rig.position.set(0, 0, 0);
+  rig.rotation.set(0, 0, 0);
+  panel.visible = false;
+  if (selectedId !== null) showInfoDesktop();
+});
+
+// ---------- VR-Steuerung (Gehen / Fliegen / Drehen) ----------
+const UP = new THREE.Vector3(0, 1, 0);
+const fwd = new THREE.Vector3();
+const rightV = new THREE.Vector3();
+const prevBtn = { left: {}, right: {}, none: {} };
+let turnLock = false;
+const DZ = 0.15;
+
+function onButton(i) {
+  if (!entries.length) return;
+  if (i === 4) { page++; drawPanel(); }
+  if (i === 5) { if (panel.visible) panel.visible = false; else showPanelInVR(); }
+}
+
+function handleXRInput(dt) {
+  const session = renderer.xr.getSession();
+  if (!session) return;
+  const cam = renderer.xr.getCamera();
+  for (const src of session.inputSources) {
+    const gp = src.gamepad;
+    if (!gp) continue;
+    const hand = src.handedness || 'none';
+    const sx = gp.axes[2] || 0;
+    const sy = gp.axes[3] || 0;
+
+    if (hand === 'left') {
+      if (Math.hypot(sx, sy) > DZ) {
+        const speed = (gp.buttons[3] && gp.buttons[3].pressed ? 6 : 2) * dt;
+        cam.getWorldDirection(fwd);
+        fwd.y = 0;
+        fwd.normalize();
+        rightV.crossVectors(fwd, UP).normalize();
+        rig.position.addScaledVector(fwd, -sy * speed).addScaledVector(rightV, sx * speed);
+      }
+    } else if (hand === 'right') {
+      if (Math.abs(sx) > 0.7) {
+        if (!turnLock) { rig.rotation.y -= Math.sign(sx) * Math.PI / 6; turnLock = true; }
+      } else {
+        turnLock = false;
+      }
+      if (Math.abs(sy) > DZ) rig.position.y -= sy * 2.5 * dt;
+    }
+
+    const pb = prevBtn[hand] || (prevBtn[hand] = {});
+    [4, 5].forEach((i) => {
+      const pressed = !!(gp.buttons[i] && gp.buttons[i].pressed);
+      if (pressed && !pb[i]) onButton(i);
+      pb[i] = pressed;
+    });
+  }
+}
+
+// ---------- Render-Schleife ----------
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (renderer.xr.isPresenting) handleXRInput(dt);
+  else controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
